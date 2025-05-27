@@ -5,6 +5,7 @@ from transformers import BertTokenizer, BertConfig
 from transformers import BertTokenizer as ElasticBertTokenizer
 from models.modeling_elasticbert import ElasticBertForPreTraining
 from models.configuration_elasticbert import ElasticBertConfig
+from models.modeling_diffusion_bert import DiffusionBertForMaskedLM
 # from perplexity import ppl
 from sample import Categorical, WholeWordMasking
 import time
@@ -39,7 +40,7 @@ if model_name in ['fnlp/elasticbert-base', 'fnlp/elasticbert-large']:
     cfg_cls = ElasticBertConfig
     tok_cls = ElasticBertTokenizer
 elif model_name in ['bert-base-uncased', 'bert-large-uncased']:
-    model_cls = BertForMaskedLM
+    model_cls = DiffusionBertForMaskedLM
     cfg_cls = BertConfig
     tok_cls = BertTokenizer
 else:
