@@ -1,27 +1,33 @@
 import os
-
-from transformers import BertTokenizer, RobertaTokenizer
 import torch
-from dataloader import DiffusionLoader
-import numpy as np
-import diffusion_word_freq
-import math
+from transformers import BertTokenizer
+import datasets
 from tqdm import tqdm
 
-# tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+# Initialize tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-train_data = DiffusionLoader(tokenizer=tokenizer).my_load(task_name='lm1b', splits=['train'])[0]
 
+# Load dataset
+print("Loading dataset...")
+dataset = datasets.load_dataset('lm1b', split='train[:50000]')
+
+# Initialize word frequency counter
 word_freq = torch.zeros((tokenizer.vocab_size,), dtype=torch.int64)
 
-for data in tqdm(train_data):
-    for iid in data['input_ids']:
-        word_freq[iid] += 1
+# Process each example
+print("Processing examples...")
+for example in tqdm(dataset):
+    # Tokenize text
+    tokens = tokenizer.encode(example['text'], max_length=128, truncation=True, add_special_tokens=False)
+    # Count frequencies
+    for token_id in tokens:
+        word_freq[token_id] += 1
 
+# Create output directory if it doesn't exist
 if not os.path.exists('./word_freq'):
     os.mkdir('word_freq')
 
-torch.save(word_freq, f'./word_freq/bert-base-uncased_lm1b.pt')
-
-
-
+# Save word frequencies
+print("Saving word frequencies...")
+torch.save(word_freq, './word_freq/bert-base-uncased_lm1b.pt')
+print("Done!") 
