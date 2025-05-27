@@ -1,62 +1,96 @@
 # DiffusionBERT
 
-![](src/DiffusionBERT.gif)
+This is an implementation of DiffusionBERT: Improving Generative Masked Language Models with Diffusion Models.
 
-Official implementation of [DiffusionBERT: Improving Generative Masked Language Models with Diffusion Models](https://arxiv.org/abs/2211.15029).
+## Quick Start with Google Colab
 
-### Update
+1. Open the `DiffusionBERT.ipynb` notebook in Google Colab:
+   - Go to [Google Colab](https://colab.research.google.com)
+   - Click File -> Upload Notebook
+   - Select the `DiffusionBERT.ipynb` file from this repository
 
-**2023.1.25** Release the code. Please check out our paper for more details.
+2. Make sure you're using a GPU runtime:
+   - Click Runtime -> Change runtime type
+   - Select "GPU" from the Hardware accelerator dropdown
+   - Click Save
 
-**2022.11.30** Initial commit.
+3. Run the cells in order:
+   - The first cell clones this repository
+   - The second cell installs required dependencies
+   - The third cell downloads and prepares the LM1B dataset
+   - The fourth cell calculates word frequencies
+   - The fifth cell trains the model
+   - The sixth cell generates text samples
 
-### Abstract
-We present DiffusionBERT, a new generative masked language model based on discrete diffusion models.
-Diffusion models and many pre-trained language models have a shared training objective, i.e., denoising, making it possible to combine the two powerful models and enjoy the best of both worlds. 
-On the one hand, diffusion models offer a promising training strategy that helps improve the generation quality.
-On the other hand, pre-trained denoising language models (e.g., BERT) can be used as a good initialization that accelerates convergence.
-We explore training BERT to learn the reverse process of a discrete diffusion process with an absorbing state and elucidate several designs to improve it.
-First, we propose a new noise schedule for the forward diffusion process that controls the degree of noise added at each step based on the information of each token.
-Second, we investigate several designs of incorporating the time step into BERT.
-Experiments on unconditional text generation demonstrate that DiffusionBERT achieves significant improvement over existing diffusion models for text (e.g., D3PM and Diffusion-LM) and previous generative masked language models in terms of perplexity and BLEU score.
+## Local Setup
 
-### Preparing the Environment & Data
+If you prefer to run the code locally:
 
-We have prepared the required environment in `requirements.txt`. We use `fitlog` to monitor our training process.
-
+1. Clone the repository:
 ```bash
-conda create --name DB python=3.8
-conda activate DB
+git clone https://github.com/KfirCohen-PyLab/Diffusion-BERT.git
+cd Diffusion-BERT
+```
+
+2. Install dependencies:
+```bash
 pip install -r requirements.txt
 ```
 
-The LM1B dataset is available at 🤗 Datasets. We use the same data for conditional generation in [DiffuSeq](https://github.com/Shark-NLP/DiffuSeq). We have prepared the loading script in `conditional_data/`. One only needs to download the `*.jsonl` files to the corresponding directories.
-
-### Training
-
-To add spindle schedule into our training process, we first need to run `python word_freq.py` to get the frequency in the text corpus.
-
-We have prepared the default training parameters in `run.sh` for unconditional generation and `run_condition.sh` for *Seq2seq* tasks.
-
-In general, training with only 1 NVIDIA RTX 3090 GPU acheives comparable performance with the results reported in the paper. But this requires gradient accumulation to slightly enlarge the batch size, say 64.
-
-### Sampling
-
-We need to pass the path to the checkpoint obtained during training to `predict.py` (resp. `predict_downstream_condition.py`) to unconditionally (resp. conditionally) sample from DiffusionBERT.
-
-The arguments of `predict_downstream_condition.py` include MBR size and time step size etc. The generation results and the MBR selected text are saved to `./generation_results`
-
-### Evaluation
-
-To evaluate the performance of DiffusionBERT, we can usethe functions provided in `compute_elbo.py` and `compute_metric.py`. ELBO is used to derive perplexity. Other metrics reported in the paper are included in `compute_metric.py`.
-
-
-
-Welcome to post an issue or send me an email if there are any questions.
-
-### Citation
-
+3. Download and prepare the dataset:
+```bash
+python -c "from datasets import load_dataset; dataset = load_dataset('lm1b', split='train[:50000]')"
 ```
+
+4. Calculate word frequencies:
+```bash
+python word_freq.py
+```
+
+5. Train the model:
+```bash
+python main.py \
+    --train_data_dir "./conditional_data" \
+    --vocab_size 30522 \
+    --block_size 128 \
+    --batch_size 64 \
+    --learning_rate 1e-4 \
+    --num_train_epochs 100 \
+    --gradient_accumulation_steps 2 \
+    --model_type "bert-base-uncased" \
+    --diffusion_steps 2000 \
+    --noise_schedule "cosine" \
+    --spindle_schedule True \
+    --word_freq_file "word_freq.json" \
+    --output_dir "./diffusion_models" \
+    --num_workers 4 \
+    --fp16 True
+```
+
+6. Generate text:
+```bash
+python predict.py \
+    --checkpoint_path "./diffusion_models/checkpoint-10.pt" \
+    --model_type "bert-base-uncased" \
+    --vocab_size 30522 \
+    --block_size 128 \
+    --batch_size 4 \
+    --diffusion_steps 2000 \
+    --output_file "generated_texts.txt"
+```
+
+## Model Architecture
+
+DiffusionBERT combines BERT with discrete diffusion models to improve text generation. Key features:
+
+- Uses BERT as the base model for denoising
+- Implements a discrete diffusion process with an absorbing state
+- Includes a spindle schedule for noise addition based on token information
+- Supports both unconditional and conditional text generation
+
+## Citation
+
+```bibtex
 @article{he2022diffusionbert,
   title={DiffusionBERT: Improving Generative Masked Language Models with Diffusion Models},
   author={He, Zhengfu and Sun, Tianxiang and Wang, Kuanning and Huang, Xuanjing and Qiu, Xipeng},

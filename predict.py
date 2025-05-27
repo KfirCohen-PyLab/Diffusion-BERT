@@ -7,11 +7,19 @@ from tqdm import tqdm
 from compute_metric import bleu, self_bleu
 import nltk
 import argparse
+from main import DiffusionBERT
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--topk", default=30, type=int, required=False)
 parser.add_argument("--step_size", default=2, type=int, required=False)
 parser.add_argument("--name", default='D3PM', type=str, required=False)
+parser.add_argument("--checkpoint_path", type=str, required=True)
+parser.add_argument("--model_type", type=str, default="bert-base-uncased")
+parser.add_argument("--vocab_size", type=int, default=30522)
+parser.add_argument("--block_size", type=int, default=128)
+parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--diffusion_steps", type=int, default=2000)
+parser.add_argument("--output_file", type=str, default="generated_texts.txt")
 args = parser.parse_args()
 
 step_size = args.step_size
@@ -203,3 +211,52 @@ with open(f'./temp.txt', 'a+') as fdata:
                 # print(sentence)
                 for s in sentence:
                     print(s, file=fdata, flush=True)
+
+def sample_from_model(model, tokenizer, args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    
+    # Start with random tokens
+    x = torch.randint(0, args.vocab_size, (args.batch_size, args.block_size), device=device)
+    
+    # Sampling loop
+    with torch.no_grad():
+        for t in reversed(range(args.diffusion_steps)):
+            timesteps = torch.full((args.batch_size,), t, device=device)
+            logits = model(x, timesteps)
+            
+            # Sample next tokens
+            probs = torch.softmax(logits, dim=-1)
+            x = torch.multinomial(probs.view(-1, args.vocab_size), 1).view(args.batch_size, -1)
+    
+    # Decode generated sequences
+    generated_texts = []
+    for seq in x:
+        text = tokenizer.decode(seq.tolist(), skip_special_tokens=True)
+        generated_texts.append(text)
+    
+    return generated_texts
+
+def main():
+    # Initialize model and tokenizer
+    tokenizer = BertTokenizer.from_pretrained(args.model_type)
+    config = BertConfig.from_pretrained(args.model_type)
+    model = DiffusionBERT(config)
+    
+    # Load checkpoint
+    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Generate samples
+    generated_texts = sample_from_model(model, tokenizer, args)
+    
+    # Save generated texts
+    with open(args.output_file, 'w') as f:
+        for text in generated_texts:
+            f.write(text + '\n')
+    
+    print(f"Generated {len(generated_texts)} texts and saved to {args.output_file}")
+
+if __name__ == "__main__":
+    main()

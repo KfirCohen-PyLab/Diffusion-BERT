@@ -1,33 +1,41 @@
-import os
-import torch
-from transformers import BertTokenizer
-import datasets
+import json
+from collections import Counter
 from tqdm import tqdm
+from transformers import BertTokenizer
 
-# Initialize tokenizer
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+def load_jsonl(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return [json.loads(line) for line in f]
 
-# Load dataset
-print("Loading dataset...")
-dataset = datasets.load_dataset('lm1b', split='train[:50000]')
+def main():
+    # Initialize tokenizer
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    
+    # Load all data
+    all_texts = []
+    for i in range(50000):  # Adjust range based on your dataset size
+        try:
+            data = load_jsonl(f'train_{i}.jsonl')
+            all_texts.extend([item['text'] for item in data])
+        except FileNotFoundError:
+            continue
+    
+    # Tokenize all texts
+    word_counter = Counter()
+    for text in tqdm(all_texts, desc="Processing texts"):
+        tokens = tokenizer.tokenize(text)
+        word_counter.update(tokens)
+    
+    # Save word frequencies
+    total_words = sum(word_counter.values())
+    word_freqs = {word: count/total_words for word, count in word_counter.items()}
+    
+    with open('word_freq.json', 'w') as f:
+        json.dump(word_freqs, f)
+    
+    print(f"Processed {len(all_texts)} texts")
+    print(f"Found {len(word_freqs)} unique tokens")
+    print("Word frequencies saved to word_freq.json")
 
-# Initialize word frequency counter
-word_freq = torch.zeros((tokenizer.vocab_size,), dtype=torch.int64)
-
-# Process each example
-print("Processing examples...")
-for example in tqdm(dataset):
-    # Tokenize text
-    tokens = tokenizer.encode(example['text'], max_length=128, truncation=True, add_special_tokens=False)
-    # Count frequencies
-    for token_id in tokens:
-        word_freq[token_id] += 1
-
-# Create output directory if it doesn't exist
-if not os.path.exists('./word_freq'):
-    os.mkdir('word_freq')
-
-# Save word frequencies
-print("Saving word frequencies...")
-torch.save(word_freq, './word_freq/bert-base-uncased_lm1b.pt')
-print("Done!") 
+if __name__ == "__main__":
+    main() 

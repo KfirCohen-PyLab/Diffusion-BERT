@@ -8,7 +8,7 @@ import fitlog
 from dataloader import DiffusionLoader
 from transformers import BertTokenizer, BertConfig, RobertaTokenizer, RobertaConfig
 from models.modeling_roberta import RobertaForMaskedLM
-import diffusion_word_freq
+import diffusion
 from torch.optim import AdamW
 from torch.nn.utils.rnn import pad_sequence
 import fastNLP
@@ -117,8 +117,8 @@ if __name__ == '__main__':
     else:
         raise ValueError
 
-    diffusion_schedule = diffusion_word_freq.create_discrete_diffusion_schedule(args.schedule, num_steps=args.num_steps)
-    diffusion_instance = diffusion_word_freq.MaskDiffusion(
+    diffusion_schedule = diffusion.create_discrete_diffusion_schedule(args.schedule, num_steps=args.num_steps)
+    diffusion_instance = diffusion.MaskDiffusion(
         dim=tokenizer.vocab_size,
         schedule=diffusion_schedule,
         tokenizer=tokenizer,
@@ -194,7 +194,6 @@ if __name__ == '__main__':
             attention_mask = torch.cat((att_ones.repeat(bsz, 1), attention_mask, att_zeros.repeat(bsz, 1)), dim=1)
             return model(input_ids=targets, timestep=timestep - 1, attention_mask=attention_mask)['logits'][:, 1:-1, :]
     elif args.timestep == 'token':
-
         def denoise_fn(targets, timestep, attention_mask):
             assert len(targets.size()) == 2  # bsz * seqlen
             bsz = targets.size(0)
@@ -232,7 +231,7 @@ if __name__ == '__main__':
         train_loader.sampler.set_epoch(epoch)
         dev_loader.sampler.set_epoch(epoch)
         for i, batch in enumerate(tqdm(train_loader), args.load_step + 1):
-            metrics = diffusion_word_freq.compute_kl_reverse_process(
+            metrics = diffusion.compute_kl_reverse_process(
                 batch['input_ids'].to(device),
                 diffusion_instance.sample_t(),
                 denoise_fn=denoise_fn,
@@ -270,13 +269,11 @@ if __name__ == '__main__':
                 dev_metrics = {
                     'elbo': .0,
                     'elbo_in_bits_per_dim': .0,
-                    # 'likelihood': .0,
-                    # 'prior': .0,
                 }
 
                 with torch.no_grad():
                     for dev_batch in dev_loader:
-                        batch_dev_metrics = diffusion_word_freq.discrete_diffusion_elbo(
+                        batch_dev_metrics = diffusion.discrete_diffusion_elbo(
                             dev_batch['input_ids'].to(device),
                             denoise_fn=denoise_fn,
                             diffusion=diffusion_instance,
