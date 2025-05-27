@@ -3,31 +3,101 @@ import os
 from functools import partial
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from transformers import PreTrainedTokenizer
+from typing import List, Dict, Any, Optional
+import logging
 
+logger = logging.getLogger(__name__)
 
 class DiffusionLoader:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer: PreTrainedTokenizer):
         self.tokenizer = tokenizer
 
-    def _load(self, task_name, split):
-        dataset = datasets.load_dataset('lm1b', split=split)
-        print(f'Example in {split} set:')
-        print(dataset[0])
-        dataset = dataset.map(partial(self.convert_to_features, tokenizer=self.tokenizer), batched=True, remove_columns='text')
-        return dataset
+    def _load(self, task_name: str, split: str) -> datasets.Dataset:
+        try:
+            dataset = datasets.load_dataset('lm1b', split=split)
+            logger.info(f'Example in {split} set:')
+            logger.info(dataset[0])
+            
+            dataset = dataset.map(
+                partial(self.convert_to_features, tokenizer=self.tokenizer),
+                batched=True,
+                remove_columns='text',
+                desc=f"Processing {split} split"
+            )
+            return dataset
+        except Exception as e:
+            logger.error(f"Error loading dataset: {e}")
+            raise
 
-    def my_load(self, task_name, splits):
+    def my_load(self, task_name: str, splits: List[str]) -> List[datasets.Dataset]:
         return [self._load(task_name, name) for name in splits]
 
     @staticmethod
-    def convert_to_features(example_batch, tokenizer):
-        input_encodings = tokenizer.batch_encode_plus(example_batch['text'], max_length=128, truncation=True, add_special_tokens=False)
-        encodings = {
-            'input_ids': input_encodings['input_ids'],
-            'attention_mask': input_encodings['attention_mask'],
-        }
+    def convert_to_features(example_batch: Dict[str, List[str]], tokenizer: PreTrainedTokenizer) -> Dict[str, List[List[int]]]:
+        try:
+            input_encodings = tokenizer.batch_encode_plus(
+                example_batch['text'],
+                max_length=128,
+                truncation=True,
+                add_special_tokens=False,
+                return_tensors=None
+            )
+            
+            return {
+                'input_ids': input_encodings['input_ids'],
+                'attention_mask': input_encodings['attention_mask'],
+            }
+        except Exception as e:
+            logger.error(f"Error converting features: {e}")
+            raise
 
-        return encodings
+def collate_fn(batch_input: List[Dict[str, torch.Tensor]], word_freq: torch.Tensor, device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
+    try:
+        input_ids = [torch.tensor(d['input_ids'], device=device) for d in batch_input]
+        attention_mask = [torch.tensor(d['attention_mask'], device=device) for d in batch_input]
+        
+        # Process word frequencies
+        if word_freq is not None:
+            word_freq = word_freq.to(device) if device is not None else word_freq
+            word_freq_logits = [word_freq.gather(0, torch.tensor(d['input_ids'], device=device)) for d in batch_input]
+            word_freq_logits = pad_sequence(word_freq_logits, batch_first=True)
+        else:
+            word_freq_logits = None
+        
+        # Pad sequences
+        input_ids = pad_sequence(input_ids, batch_first=True)
+        attention_mask = pad_sequence(attention_mask, batch_first=True)
+        
+        output = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+        }
+        
+        if word_freq_logits is not None:
+            output['word_freq_logits'] = word_freq_logits
+            
+        return output
+    except Exception as e:
+        logger.error(f"Error in collate function: {e}")
+        raise
+
+def load_word_frequencies(path: str, device: Optional[torch.device] = None) -> torch.Tensor:
+    try:
+        if path.endswith('.pt'):
+            freq = torch.load(path, map_location=device)
+        elif path.endswith('.json'):
+            import json
+            with open(path, 'r') as f:
+                freq_dict = json.load(f)
+            freq = torch.tensor([freq_dict.get(str(i), 0.0) for i in range(len(freq_dict))], device=device)
+        else:
+            raise ValueError(f"Unsupported file format for word frequencies: {path}")
+        
+        return freq
+    except Exception as e:
+        logger.error(f"Error loading word frequencies: {e}")
+        raise
 
 class ConditionalLoader:
     def __init__(self, tokenizer, return_source_length=False):
