@@ -39,4 +39,3 @@ class WholeWordMasking(SampleClassBase):
         return sample
 
 
-
