@@ -10,7 +10,7 @@ class DiffusionLoader:
         self.tokenizer = tokenizer
 
     def _load(self, task_name, split):
-        dataset = datasets.load_dataset(task_name, split=split, cache_dir=None, force_download=True)
+        dataset = datasets.load_dataset('lm1b', split=split)
         print(f'Example in {split} set:')
         print(dataset[0])
         dataset = dataset.map(partial(self.convert_to_features, tokenizer=self.tokenizer), batched=True, remove_columns='text')
