@@ -2,17 +2,29 @@ import torch
 import torch.nn as nn
 from transformers import BertPreTrainedModel, BertModel
 from transformers.modeling_outputs import MaskedLMOutput
+from transformers.generation.utils import GenerationMixin
 
-class DiffusionBertForMaskedLM(BertPreTrainedModel):
+class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.bert = BertModel(config)
+        
+        # Prediction head
         self.cls = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
-            nn.LayerNorm(config.hidden_size),
-            nn.Linear(config.hidden_size, config.vocab_size)
+            nn.LayerNorm(config.hidden_size)
         )
+        
+        # Decoder (separate from cls to match checkpoint architecture)
+        self.predictions = nn.ModuleDict({
+            "transform": nn.ModuleDict({
+                "dense": nn.Linear(config.hidden_size, config.hidden_size),
+                "LayerNorm": nn.LayerNorm(config.hidden_size)
+            }),
+            "decoder": nn.Linear(config.hidden_size, config.vocab_size, bias=True)
+        })
+        self.predictions.bias = nn.Parameter(torch.zeros(config.vocab_size))
 
         # Time embedding components
         self.time_embed = nn.Sequential(
@@ -46,12 +58,26 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel):
 
         # Initialize weights
         self.init_weights()
+        
+        # Register position IDs buffer
+        position_ids = torch.arange(config.max_position_embeddings).expand((1, -1))
+        self.register_buffer('position_ids', position_ids)
 
     def get_output_embeddings(self):
-        return self.cls[-1]
+        return self.predictions.decoder
 
     def set_output_embeddings(self, new_embeddings):
-        self.cls[-1] = new_embeddings
+        self.predictions.decoder = new_embeddings
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
+        input_shape = input_ids.shape
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=input_ids.device)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            **kwargs
+        }
 
     def forward(
         self,
@@ -102,11 +128,21 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel):
             sequence_output = self.denoise_net(sequence_output)
             sequence_output = self.refinement(sequence_output)
 
-        prediction_scores = self.cls(sequence_output)
+        # Apply prediction head
+        hidden_states = self.cls(sequence_output)
+        
+        # Apply transform layer
+        hidden_states = self.predictions.transform.dense(hidden_states)
+        hidden_states = torch.nn.functional.gelu(hidden_states)
+        hidden_states = self.predictions.transform.LayerNorm(hidden_states)
+        
+        # Get prediction scores
+        prediction_scores = self.predictions.decoder(hidden_states)
+        prediction_scores = prediction_scores + self.predictions.bias
 
         masked_lm_loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()  # -100 index = padding token
+            loss_fct = nn.CrossEntropyLoss()
             masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
 
         if not return_dict:
