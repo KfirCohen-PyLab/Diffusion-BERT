@@ -9,29 +9,29 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.bert = BertModel(config)
         
-        # Time embedding components - matches checkpoint architecture
+        # Time embedding components - matches checkpoint architecture exactly
         self.time_embed = nn.Sequential(
-            nn.Linear(1, 768),  # Fixed size for BERT base
-            nn.ReLU(),
-            nn.Linear(768, 768),
-            nn.ReLU(),
-            nn.Linear(768, 768)  # Additional layer to match checkpoint
-        )
-
-        # Denoising network - matches checkpoint architecture
-        self.denoise_net = nn.Sequential(
-            nn.Linear(768, 1536),
-            nn.LayerNorm(1536),
+            nn.Linear(1, 1536),  # Changed to match checkpoint
             nn.ReLU(),
             nn.Linear(1536, 1536),
+            nn.ReLU(),
+            nn.Linear(1536, 768)  # Final projection to model dimension
+        )
+
+        # Denoising network - matches checkpoint architecture exactly
+        self.denoise_net = nn.Sequential(
+            nn.Linear(768, 1536),  # Input projection
             nn.LayerNorm(1536),
             nn.ReLU(),
-            nn.Linear(1536, 768),
+            nn.Linear(1536, 1536),  # Middle layer
+            nn.LayerNorm(1536),
+            nn.ReLU(),
+            nn.Linear(1536, 768),  # Output projection
             nn.LayerNorm(768),
             nn.ReLU()
         )
 
-        # Refinement network - added to match checkpoint
+        # Refinement network - matches checkpoint
         self.refinement = nn.Sequential(
             nn.Linear(768, 768),
             nn.LayerNorm(768),
@@ -92,7 +92,7 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             # Apply denoising and refinement
             sequence_output = sequence_output + time_embed
             sequence_output = self.denoise_net(sequence_output)
-            sequence_output = self.refinement(sequence_output)  # Added refinement step
+            sequence_output = self.refinement(sequence_output)
 
         # Get prediction scores (using BERT's vocab transform)
         prediction_scores = torch.matmul(sequence_output, self.bert.embeddings.word_embeddings.weight.transpose(0, 1))
