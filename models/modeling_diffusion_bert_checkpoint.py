@@ -11,22 +11,23 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
         
         # Time embedding components - matches checkpoint architecture
         self.time_embed = nn.Sequential(
-            nn.Linear(1, config.hidden_size),  # Changed from hidden_size to 1
+            nn.Linear(1, 768),  # Fixed size for BERT base
             nn.ReLU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.ReLU()  # Removed final linear layer
+            nn.Linear(768, 768),
+            nn.ReLU(),
+            nn.Linear(768, 768)  # Additional layer to match checkpoint
         )
 
         # Denoising network - matches checkpoint architecture
         self.denoise_net = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * 2),
-            nn.LayerNorm(config.hidden_size * 2),
+            nn.Linear(768, 1536),
+            nn.LayerNorm(1536),
             nn.ReLU(),
-            nn.Linear(config.hidden_size * 2, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
+            nn.Linear(1536, 1536),
+            nn.LayerNorm(1536),
             nn.ReLU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.LayerNorm(config.hidden_size),
+            nn.Linear(1536, 768),
+            nn.LayerNorm(768),
             nn.ReLU()
         )
 
@@ -74,7 +75,7 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
         # Apply time embedding if timestep is provided
         if timestep is not None:
             # Convert timestep to embedding
-            t_emb = timestep.float().view(-1, 1) / sequence_output.shape[1]
+            t_emb = timestep.float().view(-1, 1)
             
             # Get time embedding
             time_embed = self.time_embed(t_emb)
@@ -85,8 +86,7 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             sequence_output = self.denoise_net(sequence_output)
 
         # Get prediction scores (using BERT's vocab transform)
-        prediction_scores = self.bert.embeddings.word_embeddings(input_ids).transpose(1, 2)
-        prediction_scores = torch.matmul(sequence_output, prediction_scores)
+        prediction_scores = torch.matmul(sequence_output, self.bert.embeddings.word_embeddings.weight.transpose(0, 1))
 
         masked_lm_loss = None
         if labels is not None:
