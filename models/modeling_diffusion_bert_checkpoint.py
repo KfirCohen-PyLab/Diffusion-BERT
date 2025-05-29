@@ -31,6 +31,14 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             nn.ReLU()
         )
 
+        # Refinement network - added to match checkpoint
+        self.refinement = nn.Sequential(
+            nn.Linear(768, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Linear(768, 768)
+        )
+
         # Initialize weights
         self.init_weights()
         
@@ -81,9 +89,10 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             time_embed = self.time_embed(t_emb)
             time_embed = time_embed.unsqueeze(1).expand(-1, sequence_output.shape[1], -1)
             
-            # Apply denoising
+            # Apply denoising and refinement
             sequence_output = sequence_output + time_embed
             sequence_output = self.denoise_net(sequence_output)
+            sequence_output = self.refinement(sequence_output)  # Added refinement step
 
         # Get prediction scores (using BERT's vocab transform)
         prediction_scores = torch.matmul(sequence_output, self.bert.embeddings.word_embeddings.weight.transpose(0, 1))
