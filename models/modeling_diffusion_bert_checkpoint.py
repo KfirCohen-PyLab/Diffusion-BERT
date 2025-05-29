@@ -3,35 +3,48 @@ import torch.nn as nn
 from transformers import BertPreTrainedModel, BertModel
 from transformers.modeling_outputs import MaskedLMOutput
 from transformers.generation.utils import GenerationMixin
+from .configuration_diffusion_bert import DiffusionBertConfig
 
-class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
+class DiffusionBertForMaskedLM(BertPreTrainedModel):
+    config_class = DiffusionBertConfig
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
+    _keys_to_ignore_on_load_unexpected = [r"pooler"]
+
     def __init__(self, config):
         super().__init__(config)
-        self.bert = BertModel(config)
+
+        if config.is_decoder:
+            logger.warning(
+                "If you want to use `DiffusionBertForMaskedLM` make sure `config.is_decoder=False` for "
+                "bi-directional self-attention."
+            )
+
+        # Initialize BERT model without pooler
+        self.bert = BertModel(config, add_pooling_layer=False)
         
-        # Time embedding components - matches checkpoint architecture exactly
+        # Time embedding components - dimensions from checkpoint
         self.time_embed = nn.Sequential(
-            nn.Linear(1, 1536),  # Changed to match checkpoint
+            nn.Linear(1, 768),  # [768, 1]
             nn.ReLU(),
-            nn.Linear(1536, 1536),
+            nn.Linear(768, 768),  # [768, 768]
             nn.ReLU(),
-            nn.Linear(1536, 768)  # Final projection to model dimension
+            nn.Linear(768, 768)  # [768, 768]
         )
 
-        # Denoising network - matches checkpoint architecture exactly
+        # Denoising network - dimensions from checkpoint
         self.denoise_net = nn.Sequential(
-            nn.Linear(768, 1536),  # Input projection
+            nn.Linear(768, 1536),  # [1536, 768]
             nn.LayerNorm(1536),
             nn.ReLU(),
-            nn.Linear(1536, 1536),  # Middle layer
+            nn.Linear(1536, 1536),  # [1536, 1536]
             nn.LayerNorm(1536),
             nn.ReLU(),
-            nn.Linear(1536, 768),  # Output projection
+            nn.Linear(1536, 768),  # [768, 1536]
             nn.LayerNorm(768),
             nn.ReLU()
         )
 
-        # Refinement network - matches checkpoint
+        # Refinement network
         self.refinement = nn.Sequential(
             nn.Linear(768, 768),
             nn.LayerNorm(768),
@@ -39,12 +52,17 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             nn.Linear(768, 768)
         )
 
-        # Initialize weights
-        self.init_weights()
-        
-        # Register position IDs buffer
-        position_ids = torch.arange(config.max_position_embeddings).expand((1, -1))
-        self.register_buffer('position_ids', position_ids)
+        # MLM head
+        self.cls = BertOnlyMLMHead(config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_output_embeddings(self):
+        return self.cls.predictions.decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.cls.predictions.decoder = new_embeddings
 
     def forward(
         self,
@@ -94,8 +112,7 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             sequence_output = self.denoise_net(sequence_output)
             sequence_output = self.refinement(sequence_output)
 
-        # Get prediction scores (using BERT's vocab transform)
-        prediction_scores = torch.matmul(sequence_output, self.bert.embeddings.word_embeddings.weight.transpose(0, 1))
+        prediction_scores = self.cls(sequence_output)
 
         masked_lm_loss = None
         if labels is not None:
@@ -111,4 +128,47 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             logits=prediction_scores,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        ) 
+        )
+
+class BertOnlyMLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.predictions = BertLMPredictionHead(config)
+
+    def forward(self, sequence_output):
+        prediction_scores = self.predictions(sequence_output)
+        return prediction_scores
+
+class BertLMPredictionHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.transform = BertPredictionHeadTransform(config)
+
+        # The output weights are the same as the input embeddings, but there is
+        # an output-only bias for each token.
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+
+        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
+        self.decoder.bias = self.bias
+
+    def forward(self, hidden_states):
+        hidden_states = self.transform(hidden_states)
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+
+class BertPredictionHeadTransform(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if isinstance(config.hidden_act, str):
+            self.transform_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.transform_act_fn = config.hidden_act
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states)
+        return hidden_states 
