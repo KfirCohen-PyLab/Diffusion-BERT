@@ -79,6 +79,12 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             **kwargs
         }
 
+    def _reorder_cache(self, past, beam_idx):
+        reordered_past = ()
+        for layer_past in past:
+            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+        return reordered_past
+
     def forward(
         self,
         input_ids=None,
@@ -97,8 +103,9 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Get BERT outputs
         outputs = self.bert(
-            input_ids,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -108,30 +115,27 @@ class DiffusionBertForMaskedLM(BertPreTrainedModel, GenerationMixin):
             encoder_attention_mask=encoder_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=return_dict
         )
 
+        # Get sequence output
         sequence_output = outputs[0]
 
         # Apply time embedding if timestep is provided
         if timestep is not None:
-            # Convert timestep to embedding
-            t_emb = torch.arange(0, sequence_output.shape[1], device=sequence_output.device).unsqueeze(0)
-            t_emb = t_emb.repeat(sequence_output.shape[0], 1)
-            t_emb = t_emb.float() / sequence_output.shape[1]
-            
-            # Get time embedding
-            time_embed = self.time_embed(t_emb.unsqueeze(-1).float())
-            
-            # Apply denoising and refinement
-            sequence_output = sequence_output + time_embed
-            sequence_output = self.denoise_net(sequence_output)
-            sequence_output = self.refinement(sequence_output)
+            time_emb = self.time_embed(timestep.unsqueeze(-1).float())
+            sequence_output = sequence_output + time_emb.unsqueeze(1)
 
-        # Apply prediction head
-        hidden_states = self.cls(sequence_output)
+        # Apply denoising network
+        hidden_states = self.denoise_net(sequence_output)
         
-        # Apply transform layer
+        # Apply refinement
+        hidden_states = self.refinement(hidden_states)
+        
+        # Apply prediction head
+        hidden_states = self.cls(hidden_states)
+        
+        # Apply final transformation
         hidden_states = self.predictions.transform.dense(hidden_states)
         hidden_states = torch.nn.functional.gelu(hidden_states)
         hidden_states = self.predictions.transform.LayerNorm(hidden_states)

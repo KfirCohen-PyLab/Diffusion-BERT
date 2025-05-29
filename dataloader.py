@@ -6,6 +6,8 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizer
 from typing import List, Dict, Any, Optional
 import logging
+import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -15,15 +17,26 @@ class DiffusionLoader:
 
     def _load(self, task_name: str, split: str) -> datasets.Dataset:
         try:
-            dataset = datasets.load_dataset('lm1b', split=split)
+            # Create data directory if it doesn't exist
+            os.makedirs('./data', exist_ok=True)
+            
+            # Download dataset to local cache
+            dataset = datasets.load_dataset(
+                'lm1b', 
+                split=split,
+                cache_dir='./data',
+                download_mode='force_redownload'
+            )
             logger.info(f'Example in {split} set:')
             logger.info(dataset[0])
             
+            # Process the dataset
             dataset = dataset.map(
                 partial(self.convert_to_features, tokenizer=self.tokenizer),
                 batched=True,
-                remove_columns='text',
-                desc=f"Processing {split} split"
+                remove_columns=['text'],
+                desc=f"Processing {split} split",
+                load_from_cache_file=False  # Don't use cache for processing
             )
             return dataset
         except Exception as e:
@@ -40,6 +53,7 @@ class DiffusionLoader:
                 example_batch['text'],
                 max_length=128,
                 truncation=True,
+                padding=True,
                 add_special_tokens=False,
                 return_tensors=None
             )
@@ -52,35 +66,18 @@ class DiffusionLoader:
             logger.error(f"Error converting features: {e}")
             raise
 
-def collate_fn(batch_input: List[Dict[str, torch.Tensor]], word_freq: torch.Tensor, device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
-    try:
-        input_ids = [torch.tensor(d['input_ids'], device=device) for d in batch_input]
-        attention_mask = [torch.tensor(d['attention_mask'], device=device) for d in batch_input]
-        
-        # Process word frequencies
-        if word_freq is not None:
-            word_freq = word_freq.to(device) if device is not None else word_freq
-            word_freq_logits = [word_freq.gather(0, torch.tensor(d['input_ids'], device=device)) for d in batch_input]
-            word_freq_logits = pad_sequence(word_freq_logits, batch_first=True)
-        else:
-            word_freq_logits = None
-        
-        # Pad sequences
-        input_ids = pad_sequence(input_ids, batch_first=True)
-        attention_mask = pad_sequence(attention_mask, batch_first=True)
-        
-        output = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-        }
-        
-        if word_freq_logits is not None:
-            output['word_freq_logits'] = word_freq_logits
-            
-        return output
-    except Exception as e:
-        logger.error(f"Error in collate function: {e}")
-        raise
+def collate_fn(examples):
+    """Batch examples together for training."""
+    input_ids = [torch.tensor(ex['input_ids']) for ex in examples]
+    attention_mask = [torch.tensor(ex['attention_mask']) for ex in examples]
+    
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask
+    }
 
 def load_word_frequencies(path: str, device: Optional[torch.device] = None) -> torch.Tensor:
     try:
@@ -248,6 +245,48 @@ class DiffusionLoaderWithElectra(DiffusionLoader):
         }
 
         return encodings
+
+test_examples = [
+    "The quick brown fox jumps over the lazy [MASK].",
+    "I love to [MASK] in my free time.",
+    "The capital of France is [MASK]."
+]
+
+def save_evaluation_results(results, file_path):
+    with open(file_path, 'w') as f:
+        json.dump(results, f, indent=4)
+
+def evaluate_on_examples(model, tokenizer, examples):
+    results = []
+    for example in examples:
+        inputs = tokenizer.encode_plus(example, return_tensors='pt')
+        outputs = model.generate(**inputs)
+        output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        results.append({
+            "input": example,
+            "output": output_text
+        })
+    return results
+
+def main():
+    # Training code here
+    # ...
+
+    # Evaluate on test examples
+    test_results = evaluate_on_examples(model, tokenizer, test_examples)
+
+    # Save evaluation results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = f"./checkpoints/evaluation_results_{timestamp}.json"
+    save_evaluation_results({
+        "timestamp": timestamp,
+        "best_epoch": best_epoch,
+        "best_loss": best_loss,
+        "examples": test_results
+    }, results_file)
+
+if __name__ == "__main__":
+    main()
 
 
 
