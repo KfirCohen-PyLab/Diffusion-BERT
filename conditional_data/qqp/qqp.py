@@ -16,7 +16,7 @@ class QQP(datasets.GeneratorBasedBuilder):
         )
 
     def _split_generators(self, dl_manager):
-        data_dir = '/nvme/txsun/zfhe/conditional_data/qqp'
+        data_dir = 'G:\ML_Project_Sem6\Diffusion-BERT-main\data\qqp'
         return [
             datasets.SplitGenerator(
                 name=datasets.Split.TEST, gen_kwargs={"filepath": os.path.join(data_dir, "test.jsonl")}

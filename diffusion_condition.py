@@ -794,6 +794,10 @@ def discrete_diffusion_elbo(
     Returns:
     the full ELBO bound.
     """
+    print("DEBUG: diffusion.num_steps =", diffusion.num_steps)
+    print("DEBUG: eval_step_size =", eval_step_size)
+    print("DEBUG: num_steps % eval_step_size =", diffusion.num_steps % eval_step_size)
+    
     assert diffusion.num_steps % eval_step_size == 0
     assert diffusion.num_steps > eval_step_size
 

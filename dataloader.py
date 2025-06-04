@@ -3,98 +3,31 @@ import os
 from functools import partial
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from transformers import PreTrainedTokenizer
-from typing import List, Dict, Any, Optional
-import logging
-import json
-from datetime import datetime
 
-logger = logging.getLogger(__name__)
 
 class DiffusionLoader:
-    def __init__(self, tokenizer: PreTrainedTokenizer):
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
-    def _load(self, task_name: str, split: str) -> datasets.Dataset:
-        try:
-            # Create data directory if it doesn't exist
-            os.makedirs('./data', exist_ok=True)
-            
-            # Download dataset to local cache
-            dataset = datasets.load_dataset(
-                'lm1b', 
-                split=split,
-                cache_dir='./data',
-                download_mode='force_redownload'
-            )
-            logger.info(f'Example in {split} set:')
-            logger.info(dataset[0])
-            
-            # Process the dataset
-            dataset = dataset.map(
-                partial(self.convert_to_features, tokenizer=self.tokenizer),
-                batched=True,
-                remove_columns=['text'],
-                desc=f"Processing {split} split",
-                load_from_cache_file=False  # Don't use cache for processing
-            )
-            return dataset
-        except Exception as e:
-            logger.error(f"Error loading dataset: {e}")
-            raise
+    def _load(self, task_name, split):
+        dataset = datasets.load_dataset('lm1b', split=split)
+        print(f'Example in {split} set:')
+        print(dataset[0])
+        dataset = dataset.map(partial(self.convert_to_features, tokenizer=self.tokenizer), batched=True, remove_columns='text')
+        return dataset
 
-    def my_load(self, task_name: str, splits: List[str]) -> List[datasets.Dataset]:
+    def my_load(self, task_name, splits):
         return [self._load(task_name, name) for name in splits]
 
     @staticmethod
-    def convert_to_features(example_batch: Dict[str, List[str]], tokenizer: PreTrainedTokenizer) -> Dict[str, List[List[int]]]:
-        try:
-            input_encodings = tokenizer.batch_encode_plus(
-                example_batch['text'],
-                max_length=128,
-                truncation=True,
-                padding=True,
-                add_special_tokens=False,
-                return_tensors=None
-            )
-            
-            return {
-                'input_ids': input_encodings['input_ids'],
-                'attention_mask': input_encodings['attention_mask'],
-            }
-        except Exception as e:
-            logger.error(f"Error converting features: {e}")
-            raise
+    def convert_to_features(example_batch, tokenizer):
+        input_encodings = tokenizer.batch_encode_plus(example_batch['text'], max_length=128, truncation=True, add_special_tokens=False)
+        encodings = {
+            'input_ids': input_encodings['input_ids'],
+            'attention_mask': input_encodings['attention_mask'],
+        }
 
-def collate_fn(examples):
-    """Batch examples together for training."""
-    input_ids = [torch.tensor(ex['input_ids']) for ex in examples]
-    attention_mask = [torch.tensor(ex['attention_mask']) for ex in examples]
-    
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-    
-    return {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask
-    }
-
-def load_word_frequencies(path: str, device: Optional[torch.device] = None) -> torch.Tensor:
-    try:
-        if path.endswith('.pt'):
-            freq = torch.load(path, map_location=device)
-        elif path.endswith('.json'):
-            import json
-            with open(path, 'r') as f:
-                freq_dict = json.load(f)
-            freq = torch.tensor([freq_dict.get(str(i), 0.0) for i in range(len(freq_dict))], device=device)
-        else:
-            raise ValueError(f"Unsupported file format for word frequencies: {path}")
-        
-        return freq
-    except Exception as e:
-        logger.error(f"Error loading word frequencies: {e}")
-        raise
+        return encodings
 
 class ConditionalLoader:
     def __init__(self, tokenizer, return_source_length=False):
@@ -112,20 +45,50 @@ class ConditionalLoader:
         }
 
     def load_original(self, split):
-        dataset = datasets.load_dataset(os.path.join(self.data_dir, self.task_name, f'{self.task_name}.py'), split=split)
+        dataset = datasets.load_dataset(os.path.join(self.data_dir, self.task_name, f'{self.task_name}.py'), split=split , trust_remote_code=True)
         dataset = dataset.map(partial(self._convert_to_features_original, tokenizer=self.tokenizer), batched=True, load_from_cache_file=False)
+        
         print(f'Example in {split} set:')
         print(dataset[0])
         return dataset
 
-    def _load(self, split):
-        dataset = datasets.load_dataset(os.path.join(self.data_dir, self.task_name, f'{self.task_name}.py'), split=split)
+    def _load(self, split, max_samples=10000):
+        # Load dataset (now with subsetting)
+        full_dataset = datasets.load_dataset(
+            os.path.join(self.data_dir, self.task_name, f'{self.task_name}.py'), 
+            split=split, 
+            trust_remote_code=True
+        )
+        
+        # Take only first N samples for demo
+        dataset = full_dataset.select(range(min(max_samples, len(full_dataset))))
+        
         if self.return_source_length:
-            dataset = dataset.map(partial(self.add_original_src_length, tokenizer=self.tokenizer))
+            dataset = dataset.map(
+                partial(self.add_original_src_length, tokenizer=self.tokenizer),
+                load_from_cache_file=False  # Faster for small datasets
+            )
+        
+        # Apply your prompt formatting
         dataset = dataset.map(self.add_prompt)
-        dataset = dataset.map(partial(self.convert_to_features, tokenizer=self.tokenizer), batched=True)
-        print(f'Example in {split} set:')
-        print(dataset[0])
+        
+        # Tokenize efficiently
+        dataset = dataset.map(
+            partial(self.convert_to_features, tokenizer=self.tokenizer),
+            batched=True,
+            batch_size=32,  # Smaller batches process faster
+            load_from_cache_file=False
+        )
+
+        # Show samples
+        print(f'\nDemo samples ({len(dataset)} examples):')
+        for i in range(min(2, len(dataset))):
+            # Show first 2 examples
+            print(f'\nExample {i+1}:')
+            print(f"Input: {dataset[i]['src']}")
+            print(f"Target: {dataset[i]['trg']}")
+            #print(f"Tokenized: {dataset[i]['input_ids'][:10]}...")  # Show first 10 tokens
+        
         return dataset
 
     def add_original_src_length(self, example, tokenizer):
@@ -245,48 +208,6 @@ class DiffusionLoaderWithElectra(DiffusionLoader):
         }
 
         return encodings
-
-test_examples = [
-    "The quick brown fox jumps over the lazy [MASK].",
-    "I love to [MASK] in my free time.",
-    "The capital of France is [MASK]."
-]
-
-def save_evaluation_results(results, file_path):
-    with open(file_path, 'w') as f:
-        json.dump(results, f, indent=4)
-
-def evaluate_on_examples(model, tokenizer, examples):
-    results = []
-    for example in examples:
-        inputs = tokenizer.encode_plus(example, return_tensors='pt')
-        outputs = model.generate(**inputs)
-        output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        results.append({
-            "input": example,
-            "output": output_text
-        })
-    return results
-
-def main():
-    # Training code here
-    # ...
-
-    # Evaluate on test examples
-    test_results = evaluate_on_examples(model, tokenizer, test_examples)
-
-    # Save evaluation results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = f"./checkpoints/evaluation_results_{timestamp}.json"
-    save_evaluation_results({
-        "timestamp": timestamp,
-        "best_epoch": best_epoch,
-        "best_loss": best_loss,
-        "examples": test_results
-    }, results_file)
-
-if __name__ == "__main__":
-    main()
 
 
 

@@ -1,194 +1,186 @@
 import torch
 import os
-from transformers import BertTokenizer, BertConfig
-from sample import Categorical, WholeWordMasking
 import time
 from tqdm import tqdm
-from compute_metric import bleu, self_bleu
-import nltk
+from transformers import BertTokenizer, BertConfig
+from sample import Categorical, WholeWordMasking
+from compute_metric import self_bleu, get_bleu 
 import argparse
-from main import DiffusionBERT
+import torch.nn.functional as F
+import warnings
 
+# Argument parsing
 parser = argparse.ArgumentParser()
-parser.add_argument("--topk", default=30, type=int, required=False)
-parser.add_argument("--step_size", default=2, type=int, required=False)
-parser.add_argument("--name", default='D3PM', type=str, required=False)
-parser.add_argument("--checkpoint_path", type=str, required=True)
-parser.add_argument("--model_type", type=str, default="bert-base-uncased")
-parser.add_argument("--vocab_size", type=int, default=30522)
-parser.add_argument("--block_size", type=int, default=128)
-parser.add_argument("--batch_size", type=int, default=4)
-parser.add_argument("--diffusion_steps", type=int, default=2000)
-parser.add_argument("--output_file", type=str, default="generated_texts.txt")
+parser.add_argument("--topk", default=100, type=int)  # Increased
+parser.add_argument("--topp", default=0.95, type=float)  # Increased
+parser.add_argument("--step_size", default=2, type=int)
+parser.add_argument("--name", default='D3PM', type=str)
+parser.add_argument("--temperature", default=1.5, type=float)  # Increased
 args = parser.parse_args()
 
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Parameters
 step_size = args.step_size
-device = 'cuda:0'
 model_name = 'bert-base-uncased'
 predict_x0 = True
 sample_strategy = 'Categorical'
 num_steps = 512
 schedule = 'mutual'
 topk = args.topk
+topp = args.topp
 iteration = 2
-shape = torch.Size([32, 32])
+shape = torch.Size([16, 32])
 name = args.name
-temperature = 0.1
+temperature = args.temperature
+vocab_size = 30522  # bert-base-uncased vocab size
+if num_steps % step_size != 0:
+    raise ValueError(f"step_size={step_size} must divide num_steps={num_steps} evenly")
+if step_size > 10:
+    warnings.warn(f"Large step_size={step_size} may cause numerical instability...")
+print(f"Running generation with model: {name}, temperature: {temperature}, topk: {topk}, topp: {topp}, step_size: {step_size}")
 
+# Model checkpoint paths
 model_path_dict = {
-    'D3PM': ('/remote-home/zfhe/projects/diffusion_torch/D3PM_new_timestep_ckpts/best(1799999).th', 'layerwise'),
-    'dbnotimestep': ('/remote-home/zfhe/projects/diffusion_torch/diffusion_bert_base_no_timestep_ckpts/best(1749999).th', 'none'),
-    'dbnewtimestep': ('/remote-home/zfhe/projects/diffusion_torch/diffusion_bert_base_new_timestep_ckpts/best(1849999).th', 'layerwise'),
-    'dbtokentimestep': ('/remote-home/zfhe/projects/diffusion_torch/model_name_bert-base-uncased_lr_3e-06_seed_42_numsteps_512_sample_Categorical_hybridlambda_0.01_schedule_mutual_new_attmask_ckpts/best(1549999).th', 'token'),
-    'word_freq5': ('/remote-home/zfhe/projects/diffusion_torch/model_name_bert-base-uncased_lr_3e-06_seed_42_numsteps_512_sample_Categorical_schedule_mutual_hybridlambda_0.01_wordfreqlambda_0.5_ckpts/best(1749999).th', 'embedding'),
-    'word_freq3': ('/remote-home/zfhe/projects/diffusion_torch/model_name_bert-base-uncased_lr_3e-06_seed_42_numsteps_512_sample_Categorical_schedule_mutual_hybridlambda_0.01_wordfreqlambda_0.3_fromscratch_False_ckpts/best(1849999).th', 'none'),
-    'word_freq3_newtimestep': ('/remote-home/zfhe/projects/diffusion_torch/model_name_bert-base-uncased_lr_3e-06_seed_42_numsteps_512_sample_Categorical_schedule_mutual_hybridlambda_0.01_wordfreqlambda_0.3_fromscratch_False_new_timestep_ckpts/best(1499999).th', 'layerwise'),
-    'word_freq_D3PM': ('/remote-home/zfhe/projects/diffusion_torch/model_name_bert-base-uncased_lr_8e-06_seed_42_numsteps_512_sample_Categorical_schedule_mutual_hybridlambda_0.01_wordfreqlambda_0.5_frpmscratch_True_ckpts/best(1849999).th', 'layerwise')
+    'D3PM': (r'G:\ML_Project_Sem6\Diffusion-BERT-main\model_name_bert-base-uncased_lr_0.0005_seed_42_numsteps_512_sample_Categorical_schedule_mutual_hybridlambda_0.01_wordfreqlambda_0.3_fromscratch_True_timestep_none_ckpts\epoch_4.pt', 'token'),
+    'custom': (r'G:\ML_Project_Sem6\Diffusion-BERT-main\model_name_bert-base-uncased_lr_3e-05_seed_42_numsteps_300_sample_Categorical_schedule_mutual_hybridlambda_0.05_wordfreqlambda_0.3_fromscratch_True_timestep_none_ckpts\epoch_5.pt', 'token'),
 }
-model_ckpt_path, timestep = model_path_dict[name]
-if name.startswith('word_freq'):
-    kind = 'word_freq'
-else:
-    kind = 'base'
+try:
+    model_ckpt_path, timestep = model_path_dict[name]
+except KeyError:
+    raise ValueError(f"Model name '{name}' not found in model_path_dict")
 
+# Import model class based on timestep strategy
 if timestep in ['none', 'token']:
     from models.modeling_bert import BertForMaskedLM
-elif timestep == 'embedding':
-    from models.modeling_bert_timestep import BertForMaskedLM
-elif timestep == 'layerwise':
+elif timestep in ['embedding', 'layerwise']:
     from models.modeling_bert_new_timestep import BertForMaskedLM
 else:
-    raise NotImplementedError
+    raise NotImplementedError(f"Timestep strategy '{timestep}' not supported")
 
+# Tokenizer
+tokenizer = BertTokenizer.from_pretrained(model_name)
 
-if model_name in ['fnlp/elasticbert-base', 'fnlp/elasticbert-large']:
-    model_cls = ElasticBertForPreTraining
-    cfg_cls = ElasticBertConfig
-    tok_cls = ElasticBertTokenizer
-elif model_name in ['bert-base-uncased', 'bert-large-uncased']:
-    model_cls = BertForMaskedLM
-    cfg_cls = BertConfig
-    tok_cls = BertTokenizer
-else:
-    raise NotImplementedError
-
-
-tokenizer = tok_cls.from_pretrained(model_name)
-
-
+# Sample strategy
 if sample_strategy == 'Categorical':
-    sample_cls = Categorical()
+    sample_cls = Categorical(device=device)
 elif sample_strategy == 'wwm':
-    sample_cls = WholeWordMasking(tokenizer)
+    sample_cls = WholeWordMasking(tokenizer, device=device)
 else:
-    raise ValueError
+    raise ValueError(f"Unknown sample strategy '{sample_strategy}'")
 
+# Determine if using word frequency variant
+kind = 'word_freq' if name.startswith('word_freq') or name == 'D3PM' else 'base'
+
+# Load diffusion schedule and instance
+import diffusion_word_freq as diffusion
+diffusion_schedule = diffusion.create_discrete_diffusion_schedule(schedule, num_steps=num_steps, device=device)
+if isinstance(diffusion_schedule, torch.Tensor):
+    diffusion_schedule = diffusion_schedule.to(device)
+elif isinstance(diffusion_schedule, dict):
+    diffusion_schedule = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in diffusion_schedule.items()}
 
 if kind == 'word_freq':
-    import diffusion_word_freq as diffusion
-    word_freq = torch.load(f'./word_freq/{model_name}.pt').to(device)
-    def word_freq_preprocess_fn(wf):
-        wf = wf + 1
-        wf = wf.log()
-        wf = wf / wf.max()
-
-        # range: 0 - 1
-        return wf
-
-    word_freq = word_freq_preprocess_fn(word_freq)
-    diffusion_schedule = diffusion.create_discrete_diffusion_schedule(schedule, num_steps=num_steps)
+    word_freq_path = r'G:\ML_Project_Sem6\Diffusion-BERT-main\word_freq\bert-base-uncased.pt'
+    try:
+        word_freq = torch.load(word_freq_path).to(device)
+        print(f"Loaded word_freq: shape={word_freq.shape}, device={word_freq.device}")
+        word_freq = (word_freq + 1).log() / (word_freq + 1).log().max()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Word frequency file not found at {word_freq_path}...")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load word frequency file {word_freq_path}: {str(e)}")
     diffusion_instance = diffusion.MaskDiffusion(
         dim=tokenizer.vocab_size,
         schedule=diffusion_schedule,
         tokenizer=tokenizer,
         sample_cls=sample_cls,
         word_freq=word_freq,
-        word_freq_lambda=0.3
+        word_freq_lambda=0.3,
+        device=device
     )
-elif kind == 'base':
-    import diffusion
-
-    diffusion_schedule = diffusion.create_discrete_diffusion_schedule(schedule, num_steps=num_steps)
+else:
     diffusion_instance = diffusion.MaskDiffusion(
         dim=tokenizer.vocab_size,
         schedule=diffusion_schedule,
         tokenizer=tokenizer,
         sample_cls=sample_cls,
+        device=device
     )
-else:
-    raise ValueError
 
-
-
-
-
-cfg = cfg_cls.from_pretrained(model_name)
+# Load model config and model
+cfg = BertConfig.from_pretrained(model_name)
 cfg.overall_timestep = diffusion_instance.num_steps
-
-if model_name in ['fnlp/elasticbert-base', 'fnlp/elasticbert-large']:
-    cfg.num_output_layers = cfg.num_hidden_layers
-    cfg.num_base_layers = 0
-model = model_cls(cfg).to(device)
-
-ckpt = torch.load(model_ckpt_path)
-model.load_state_dict(ckpt['model'])
-
-cls = torch.full((1, 1), fill_value=tokenizer.cls_token_id, device=device)
-sep = torch.full((1, 1), fill_value=tokenizer.sep_token_id, device=device)
-
-
-if timestep == 'none':
-    def denoise_fn(targets, timestep, attention_mask):
-        assert len(targets.size()) == 2  # bsz * seqlen
-        bsz = targets.size(0)
-        targets = torch.cat((cls.repeat(bsz, 1), targets, sep.repeat(bsz, 1)), dim=1)
-        # attention_mask = torch.cat((att_ones.repeat(bsz, 1), attention_mask, att_zeros.repeat(bsz, 1)), dim=1)
-        return model(
-            input_ids=targets,
-            # timestep=timestep - 1,
-            # attention_mask=attention_mask
-        )['logits'][:, 1:-1, :]
-elif timestep == 'token':
-    def denoise_fn(targets, timestep, attention_mask):
-        assert len(targets.size()) == 2  # bsz * seqlen
-        bsz = targets.size(0)
-        targets = torch.cat((
-            cls.repeat(bsz, 1),
-            torch.full((bsz, 1), fill_value=timestep.item() + 110, device=device),
-            targets,
-            sep.repeat(bsz, 1)
-        ), dim=1)
-        # attention_mask = torch.cat((torch.ones((bsz, 2), device=device), attention_mask, torch.zeros((bsz, 1), device=device)), dim=1)
-        return model(
-            input_ids=targets,
-            timestep=timestep - 1,
-            # attention_mask=attention_mask
-        )['logits'][:, 2:-1, :]
-elif timestep in ['layerwise', 'embedding']:
-    def denoise_fn(targets, timestep, attention_mask):
-        assert len(targets.size()) == 2  # bsz * seqlen
-        bsz = targets.size(0)
-        targets = torch.cat((cls.repeat(bsz, 1), targets, sep.repeat(bsz, 1)), dim=1)
-        # attention_mask = torch.cat((att_ones.repeat(bsz, 1), attention_mask, att_zeros.repeat(bsz, 1)), dim=1)
-        return model(
-            input_ids=targets,
-            timestep=timestep - 1,
-            # attention_mask=attention_mask
-        )['logits'][:, 1:-1, :]
-else:
-    raise NotImplementedError
-# att_ones = torch.ones((1, 1), device=device)
-# att_zeros = torch.zeros((1, 1), device=device)
-
-
+model = BertForMaskedLM(cfg)
+try:
+    ckpt = torch.load(model_ckpt_path, map_location=device)
+    state_dict = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
+    model.load_state_dict(state_dict)
+except Exception as e:
+    raise RuntimeError(f"Failed to load checkpoint from {model_ckpt_path}: {str(e)}")
+model = model.to(device)
 model.eval()
 
-with open(f'./temp.txt', 'a+') as fdata:
-    with open(f'./generation_results/{name}_step_curve.txt', 'a+') as fcurve:
+# Special tokens
+cls = torch.full((1, 1), tokenizer.cls_token_id, device=device)
+sep = torch.full((1, 1), tokenizer.sep_token_id, device=device)
+
+# Denoise function
+def denoise_fn(targets, timestep, attention_mask):
+    device = next(model.parameters()).device
+    bsz = targets.size(0)
+    targets = targets.to(device)
+    attention_mask = attention_mask.to(device)
+    
+    if isinstance(timestep, torch.Tensor):
+        timestep = timestep.to(device)
+        timestep_val = timestep.item()
+    else:
+        timestep_val = timestep
+
+    if timestep_val == 'none':
+        input_ids = torch.cat((cls.repeat(bsz, 1), targets, sep.repeat(bsz, 1)), dim=1)
+        attention_mask = torch.cat(
+            (torch.ones(bsz, 1, device=device), attention_mask, torch.ones(bsz, 1, device=device)), dim=1
+        )
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        logits = outputs.logits[:, 1:-1, :]
+    elif isinstance(timestep_val, (int, float)):
+        token_id = torch.full((bsz, 1), fill_value=int(timestep_val) + 110, device=device)
+        input_ids = torch.cat((cls.repeat(bsz, 1), token_id, targets, sep.repeat(bsz, 1)), dim=1)
+        attention_mask = torch.cat(
+            (torch.ones(bsz, 2, device=device), attention_mask, torch.ones(bsz, 1, device=device)), dim=1
+        )
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, timestep=timestep - 1, return_dict=True)
+        logits = outputs.logits[:, 2:-1, :]
+    else:
+        raise NotImplementedError(f"Timestep handling for '{timestep_val}' not implemented")
+
+    # Validate logits
+    if logits.shape[-1] != vocab_size:
+        print(f"denoise_fn: timestep={timestep_val}, WARNING: logits.shape={logits.shape}, expected last dim={vocab_size}")
+        raise ValueError(f"Invalid logits shape: {logits.shape}")
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        print(f"denoise_fn: timestep={timestep_val}, WARNING: NaN or inf detected in logits")
+        logits = torch.where(torch.isnan(logits) | torch.isinf(logits), torch.zeros_like(logits), logits)
+    # Debug: Log logits stats
+    probs = F.softmax(logits, dim=-1)
+    entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean()
+    print(f"denoise_fn: timestep={timestep_val}, logits entropy={entropy.item()}, min={logits.min().item()}, max={logits.max().item()}")
+    return logits
+
+# Generation loop
+os.makedirs('./generation_results', exist_ok=True)
+output_path = f'./generation_results/{name}_step_curve.txt'
+temp_path = './temp.txt'
+
+try:
+    with open(temp_path, 'w', encoding='utf-8') as fdata, open(output_path, 'a+', encoding='utf-8') as fcurve:
         sentences = []
-        wfs = []
         with torch.no_grad():
-            for i in tqdm(range(iteration)):
+            for i in tqdm(range(iteration), desc="Generating..."):
                 start = time.time()
                 state = diffusion.discrete_diffusion_predict_fn(
                     shape=shape,
@@ -198,65 +190,25 @@ with open(f'./temp.txt', 'a+') as fdata:
                     sample_cls=sample_cls,
                     step_size=step_size,
                     topk=topk,
+                    topp=topp,
                     target_mask=torch.ones(shape, device=device),
-                    show_process=False,
+                    show_process=True,
                     temperature=temperature
-                    # word_freq=True
-                    # context_fn=context_fn
                 )['final_state']
-                t = time.time() - start
-                print(t, file=fcurve, end=' ')
-                sentence = tokenizer.batch_decode(state)
-                sentences.extend(sentence)
-                # print(sentence)
-                for s in sentence:
+
+                duration = time.time() - start
+                print(duration, file=fcurve)
+
+                sentence_batch = tokenizer.batch_decode(state, skip_special_tokens=True)
+                print(f"Iteration {i}: {sentence_batch[:5]}")
+                sentences.extend(sentence_batch)
+                for s in sentence_batch:
                     print(s, file=fdata, flush=True)
+except Exception as e:
+    print(f"Error during generation: {str(e)}")
+    raise
 
-def sample_from_model(model, tokenizer, args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-    
-    # Start with random tokens
-    x = torch.randint(0, args.vocab_size, (args.batch_size, args.block_size), device=device)
-    
-    # Sampling loop
-    with torch.no_grad():
-        for t in reversed(range(args.diffusion_steps)):
-            timesteps = torch.full((args.batch_size,), t, device=device)
-            logits = model(x, timesteps)
-            
-            # Sample next tokens
-            probs = torch.softmax(logits, dim=-1)
-            x = torch.multinomial(probs.view(-1, args.vocab_size), 1).view(args.batch_size, -1)
-    
-    # Decode generated sequences
-    generated_texts = []
-    for seq in x:
-        text = tokenizer.decode(seq.tolist(), skip_special_tokens=True)
-        generated_texts.append(text)
-    
-    return generated_texts
-
-def main():
-    # Initialize model and tokenizer
-    tokenizer = BertTokenizer.from_pretrained(args.model_type)
-    config = BertConfig.from_pretrained(args.model_type)
-    model = DiffusionBERT(config)
-    
-    # Load checkpoint
-    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Generate samples
-    generated_texts = sample_from_model(model, tokenizer, args)
-    
-    # Save generated texts
-    with open(args.output_file, 'w') as f:
-        for text in generated_texts:
-            f.write(text + '\n')
-    
-    print(f"Generated {len(generated_texts)} texts and saved to {args.output_file}")
-
-if __name__ == "__main__":
-    main()
+# Optional: Compute BLEU scores
+if sentences:
+    bleu_scores = self_bleu(sentences)
+    print(f"Self-BLEU: {bleu_scores}")
