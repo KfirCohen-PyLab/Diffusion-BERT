@@ -1897,3 +1897,11 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+class DiffusionBertForMaskedLM(BertForMaskedLM):
+    def __init__(self, config, diffusion):
+        super().__init__(config)
+        self.diffusion = diffusion
+
+    def sample_and_compute_posterior_q(self, x_0, t, **kwargs):
+        return self.diffusion.sample_and_compute_posterior_q(x_0, t, **kwargs)
