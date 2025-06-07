@@ -52,7 +52,21 @@ wget https://huggingface.co/datasets/librispeech_asr/resolve/main/data/train-*.j
 ######### Training ##########
 num_steps = ceil(dataset_size / batch_size)
 
-num_step equivilent to epoch....
+Example:
+Suppose:
+
+Dataset size = 1,000 samples
+
+Batch size = 100
+
+Then:
+
+1 epoch = 10 steps (because 1,000 / 100 = 10)
+
+After 1 epoch, the model has seen all 1,000 samples once.
+
+Why train for multiple epochs?
+Training for multiple epochs allows the model to learn better. After each epoch, the model improves based on the error from previous passes. Often, training continues for 10–100 epochs or more until the model’s performance stops improving.
 
 The reverse part is with KL divergence over full logits.
 
