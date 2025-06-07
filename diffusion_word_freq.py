@@ -13,69 +13,102 @@ import math
 import losses
 import utils
 
+# Import transformers' built-in top-k/top-p filtering
+try:
+    from transformers.generation.utils import top_k_top_p_filtering
+    print("Using transformers built-in top_k_top_p_filtering")
+    USE_TRANSFORMERS_FILTERING = True
+except ImportError:
+    print("Transformers top_k_top_p_filtering not available, using custom implementation")
+    USE_TRANSFORMERS_FILTERING = False
 
-import torch
-import torch.nn.functional as F
-
-def top_k_top_p_filtering(
+def custom_top_k_top_p_filtering(
     logits, top_k=100, top_p=0.95, filter_value=-float("Inf"), min_tokens_to_keep=5, vocab_size=30522
 ):
-    """Custom top-k and top-p filtering to avoid transformers issues."""
-    # Validate shape
-    if logits.shape[-1] != vocab_size:
-        print(f"top_k_top_p_filtering: WARNING: logits.shape={logits.shape}, expected last dim={vocab_size}")
-    
-    # Check for NaN or Inf values in logits
-    if torch.isnan(logits).any() or torch.isinf(logits).any():
-        print("top_k_top_p_filtering: WARNING: NaN or inf detected, using uniform distribution")
-        logits = torch.zeros_like(logits)
-    
-    # Clamp logits to prevent extreme values
-    logits = logits.clamp(-1e4, 1e4)
+    """Custom top-k and top-p filtering as fallback."""
+    # Validate and clamp logits
+    logits = torch.clamp(logits, -1e4, 1e4)
     
     if top_k > 0:
-        # Ensure top_k is within valid range
         top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))
-        # Find the kth largest logit value
-        threshold = torch.topk(logits, top_k)[0][..., -1, None]
-        # Mask logits below threshold
-        indices_to_remove = logits < threshold
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
         logits = logits.masked_fill(indices_to_remove, filter_value)
     
     if top_p < 1.0:
-        # Sort logits descending and compute softmax cumulative probs
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         
-        # Debug log for sorted indices range
-        print(f"top_k_top_p_filtering: sorted_indices min={sorted_indices.min().item()}, max={sorted_indices.max().item()}")
-        
-        # Check indices validity
-        if sorted_indices.min().item() < 0 or sorted_indices.max().item() >= vocab_size:
-            print("top_k_top_p_filtering: WARNING: Invalid sorted_indices, using uniform distribution")
-            return torch.zeros_like(logits)
+        # Ensure sorted_indices are within bounds
+        max_index = logits.shape[-1] - 1
+        sorted_indices = torch.clamp(sorted_indices, 0, max_index)
         
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        
-        # Create mask for tokens to remove (cumulative prob > top_p)
         sorted_indices_to_remove = cumulative_probs > top_p
-        
-        # Always keep at least min_tokens_to_keep tokens
         if min_tokens_to_keep > 1:
             sorted_indices_to_remove[..., :min_tokens_to_keep] = False
         
-        # Scatter the mask back to original logits order
-        indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
-        indices_to_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
-        
-        logits = logits.masked_fill(indices_to_remove, filter_value)
-    
-    # Check if all logits are filtered (all -inf)
-    if torch.isinf(logits).all(dim=-1).any():
-        print(f"top_k_top_p_filtering: WARNING: All logits filtered out, using uniform distribution")
-        logits = torch.zeros_like(logits)
+        # Safe scatter operation - avoid out of bounds indices
+        try:
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            # Only scatter if indices are valid
+            valid_mask = (sorted_indices >= 0) & (sorted_indices < logits.shape[-1])
+            if valid_mask.any():
+                indices_to_remove.scatter_(-1, sorted_indices * valid_mask.long(), sorted_indices_to_remove)
+            logits = logits.masked_fill(indices_to_remove, filter_value)
+        except Exception as e:
+            print(f"WARNING: Scatter operation failed ({e}), skipping top-p filtering")
     
     return logits
 
+def safe_top_k_top_p_filtering(logits, top_k=100, top_p=0.95, vocab_size=30522):
+    """Safe wrapper for top-k top-p filtering that handles different transformers versions."""
+    try:
+        # Ensure logits are properly shaped and bounded
+        if logits.shape[-1] != vocab_size:
+            print(f"WARNING: logits shape {logits.shape} doesn't match vocab_size {vocab_size}")
+            # Pad or truncate to match vocab size
+            if logits.shape[-1] > vocab_size:
+                logits = logits[..., :vocab_size]
+            else:
+                padding = torch.zeros(*logits.shape[:-1], vocab_size - logits.shape[-1], 
+                                    device=logits.device, dtype=logits.dtype)
+                logits = torch.cat([logits, padding], dim=-1)
+        
+        # Check for invalid values
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("WARNING: NaN or Inf in logits, using uniform distribution")
+            return torch.zeros_like(logits)
+        
+        # Clamp logits to reasonable range
+        logits = torch.clamp(logits, -1e4, 1e4)
+        
+        if USE_TRANSFORMERS_FILTERING:
+            # Use transformers built-in function with safety checks
+            filtered_logits = top_k_top_p_filtering(
+                logits, 
+                top_k=top_k if top_k > 0 else None, 
+                top_p=top_p if top_p < 1.0 else None
+            )
+        else:
+            # Use custom implementation
+            filtered_logits = custom_top_k_top_p_filtering(
+                logits, top_k=top_k, top_p=top_p, vocab_size=vocab_size
+            )
+        
+        # Additional safety checks
+        if torch.isnan(filtered_logits).any():
+            print("WARNING: NaN in filtered logits, using original")
+            return logits
+            
+        if torch.isinf(filtered_logits).all():
+            print("WARNING: All filtered logits are -inf, using uniform")
+            return torch.zeros_like(logits)
+            
+        return filtered_logits
+        
+    except Exception as e:
+        print(f"WARNING: Filtering failed ({e}), using softmax sampling")
+        # Return softmax probabilities for safer sampling
+        return F.log_softmax(logits, dim=-1)
 
 class DiffusionSchedule:
     def __init__(self, schedule_fn, num_steps, is_constant=False, device=None):
@@ -303,21 +336,29 @@ class MaskDiffusion(DiscreteDiffusionMatrixBase):
         # Get state probability for time t
         p = self.state[t]
         
-        # Initialize word frequency influence
+        # Initialize word frequency influence with safety checks
         if word_freq_logits is None and self.word_freq is not None:
-            # Expand word_freq to match batch dimensions
-            word_freq = self.word_freq.to(q0.device)
-            word_freq = word_freq.unsqueeze(0).expand(q0.size(0), -1)  # [B, V]
-            
-            # Get the indices of the most likely tokens
-            token_indices = q0.argmax(dim=-1)  # [B, L]
-            
-            # Gather word frequencies for the selected tokens
-            word_freq_for_tokens = word_freq.gather(1, token_indices)  # [B, L]
-            word_freq_for_tokens = word_freq_for_tokens - word_freq_for_tokens.mean(dim=1, keepdim=True)
-            
-            # Scale the word frequency influence
-            word_freq_influence = self.word_freq_lambda[t] * word_freq_for_tokens.unsqueeze(-1)  # [B, L, 1]
+            try:
+                # Expand word_freq to match batch dimensions
+                word_freq = self.word_freq.to(q0.device)
+                word_freq = word_freq.unsqueeze(0).expand(q0.size(0), -1)  # [B, V]
+                
+                # Get the indices of the most likely tokens with bounds checking
+                token_indices = q0.argmax(dim=-1)  # [B, L]
+                
+                # Ensure token indices are within valid range
+                token_indices = torch.clamp(token_indices, 0, word_freq.shape[-1] - 1)
+                
+                # Gather word frequencies for the selected tokens
+                word_freq_for_tokens = word_freq.gather(1, token_indices)  # [B, L]
+                word_freq_for_tokens = word_freq_for_tokens - word_freq_for_tokens.mean(dim=1, keepdim=True)
+                
+                # Scale the word frequency influence
+                word_freq_influence = self.word_freq_lambda[t] * word_freq_for_tokens.unsqueeze(-1)  # [B, L, 1]
+                
+            except Exception as e:
+                print(f"WARNING: Word frequency processing failed ({e}), skipping")
+                word_freq_influence = 0.0
         else:
             word_freq_influence = 0.0
 
@@ -328,18 +369,32 @@ class MaskDiffusion(DiscreteDiffusionMatrixBase):
         if isinstance(word_freq_influence, torch.Tensor):
             non_mask_prob = torch.clamp(non_mask_prob + word_freq_influence, 0., 0.999)
         
-        # Calculate mask probability
-        mask_prob = 1 - non_mask_prob.sum(-1, keepdim=True) + non_mask_prob[..., self.tokenizer.mask_token_id].unsqueeze(-1)
+        # Calculate mask probability with bounds checking
+        mask_token_id = self.tokenizer.mask_token_id
+        if mask_token_id >= self.dim:
+            print(f"WARNING: mask_token_id {mask_token_id} >= dim {self.dim}, using dim-1")
+            mask_token_id = self.dim - 1
         
-        # Concatenate probabilities
-        prob_at_time_t = torch.cat(
-            (
-                non_mask_prob[..., :self.tokenizer.mask_token_id],
-                mask_prob,
-                non_mask_prob[..., self.tokenizer.mask_token_id + 1:]
-            ),
-            dim=-1
-        )
+        mask_prob = 1 - non_mask_prob.sum(-1, keepdim=True) + non_mask_prob[..., mask_token_id].unsqueeze(-1)
+        
+        # Concatenate probabilities safely
+        try:
+            prob_at_time_t = torch.cat(
+                (
+                    non_mask_prob[..., :mask_token_id],
+                    mask_prob,
+                    non_mask_prob[..., mask_token_id + 1:]
+                ),
+                dim=-1
+            )
+        except Exception as e:
+            print(f"WARNING: Probability concatenation failed ({e}), using uniform")
+            prob_at_time_t = torch.ones_like(q0) / self.dim
+        
+        # Ensure probabilities are valid
+        if torch.isnan(prob_at_time_t).any() or torch.isinf(prob_at_time_t).any():
+            print(f"WARNING: Invalid probabilities in noise_fn, using uniform")
+            prob_at_time_t = torch.ones_like(q0) / self.dim
         
         print(f"noise_fn: t={t}, prob_at_time_t min={prob_at_time_t.min().item()}, max={prob_at_time_t.max().item()}")
         return prob_at_time_t
@@ -719,28 +774,69 @@ def discrete_diffusion_predict_fn(
             step_size=step_size
         )
         x0 = x0_logits.argmax(-1) if x0_logits is not None else None
-        # Validate logits
+        
+        # Validate and fix logits
         if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print(f"sampling_step: t={t}, WARNING: NaN or inf in logits, clamping")
-            logits = torch.where(torch.isnan(logits) | torch.isinf(logits), torch.zeros_like(logits), logits)
+            print(f"sampling_step: t={t}, WARNING: NaN or inf in logits, using uniform")
+            logits = torch.zeros_like(logits)
+        
         logits = logits.clamp(-1e4, 1e4)
+        
         # Debug: Log logits stats
         probs = F.softmax(logits, dim=-1)
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean()
         print(f"sampling_step: t={t}, logits entropy={entropy.item()}, min={logits.min().item()}, max={logits.max().item()}")
+        
+        # Apply temperature
         logits = logits / temperature
-        print("got here!!!!! %f"%diffusion.dim)
-        logits = top_k_top_p_filtering(logits, top_k=topk, top_p=topp, vocab_size=diffusion.dim)
-        # Check filtered logits
-        if logits.sum(dim=-1).eq(0).any():
-            print(f"sampling_step: t={t}, WARNING: All logits filtered out, using uniform distribution")
-            logits = torch.zeros_like(logits) / logits.shape[-1]
-        sample = torch.distributions.categorical.Categorical(logits=logits).sample().to(diffusion.device)
-        # Debug: Log sample diversity
+        
+        # Apply top-k/top-p filtering safely
+        logits = safe_top_k_top_p_filtering(logits, top_k=topk, top_p=topp, vocab_size=diffusion.dim)
+        
+        # Check filtered logits and ensure valid probabilities
+        if torch.isinf(logits).all() or logits.sum(dim=-1).eq(0).any():
+            print(f"sampling_step: t={t}, WARNING: Invalid filtered logits, using uniform")
+            logits = torch.zeros_like(logits)
+        
+        # Safe sampling with bounds checking
+        try:
+            # Convert to probabilities for safer sampling
+            probs = F.softmax(logits, dim=-1)
+            
+            # Ensure no NaN in probabilities
+            if torch.isnan(probs).any():
+                print(f"sampling_step: t={t}, WARNING: NaN in probs, using uniform")
+                probs = torch.ones_like(probs) / probs.shape[-1]
+            
+            # Sample using multinomial (safer than Categorical)
+            sample = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(*probs.shape[:-1])
+            
+            # Ensure token IDs are within valid range
+            sample = torch.clamp(sample, 0, diffusion.dim - 1)
+            
+        except Exception as e:
+            print(f"sampling_step: t={t}, WARNING: Sampling failed ({e}), using mask tokens")
+            sample = torch.full_like(state.x, diffusion.tokenizer.mask_token_id)
+        
+        # Debug: Log sample info
+        if sample.numel() > 0:
+            sample_min, sample_max = sample.min().item(), sample.max().item()
+            print(f"sampling_step: t={t}, sample range: [{sample_min}, {sample_max}], vocab_size: {diffusion.dim}")
+            
+            # Additional safety check
+            if sample_min < 0 or sample_max >= diffusion.dim:
+                print(f"sampling_step: t={t}, ERROR: Invalid token IDs, clamping")
+                sample = torch.clamp(sample, 0, diffusion.dim - 1)
+        
         unique_samples = torch.unique(sample, dim=0).shape[0]
         print(f"sampling_step: t={t}, unique_samples={unique_samples}/{sample.shape[0]}")
-        if show_process:
-            print(tk.batch_decode(x0, clean_up_tokenization_spaces=False))
+        
+        if show_process and x0 is not None:
+            try:
+                print(tk.batch_decode(x0, clean_up_tokenization_spaces=False))
+            except:
+                print("Could not decode x0 tokens")
+        
         return SamplingState(x=sample, x0=x0, t=t - step_size)
 
     x = diffusion.sample_stationary(shape)

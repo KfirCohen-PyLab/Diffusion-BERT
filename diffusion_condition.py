@@ -400,12 +400,12 @@ class MaskDiffusion(DiscreteDiffusionMatrixBase):
     def _warmed_up(self):
         return (self._loss_counts == self.history_per_term).all()
 
-    # def sample_t(self, size=(1,)):
-    #     w = self.weights()
-    #     p = w / np.sum(w)
-    #     indices_np = np.random.choice(len(p), size=size, p=p)
-    #     indices = torch.from_numpy(indices_np).long()
-    #     return indices
+    def sample_t(self, size=(1,)):
+        w = self.weights()
+        p = w / np.sum(w)
+        indices_np = np.random.choice(len(p), size=size, p=p)
+        indices = torch.from_numpy(indices_np).long()
+        return indices
 
     def sample_stationary(self, size):
         return torch.full(size=size, fill_value=self.tokenizer.mask_token_id, device=self.device)
@@ -605,23 +605,32 @@ def p_forward(
     probabilities for q(x_{t-1} | x_t) (and probabilities for x0 if predict_x0
     is True)
     """
+
+    """Returns probabilities from the reverse process p(x_{t-1} | x_t)."""
     assert not (step_size > 1 and not predict_x0)
 
-    logits = denoise_fn(corrupted_input_ids=x_t, timestep=t)
-    probs = torch.nn.Softmax(dim=-1)(logits)
+    # Get BERT outputs - ensure proper shape handling
+    bert_output = denoise_fn(input_ids=x_t)
+    logits = bert_output.logits  # Shape: [batch_size, seq_len, vocab_size]
+    
+    # Handle maximum likelihood case
+    if maximum_likelihood:
+        probs = logits.argmax(-1)  # Get token IDs
+        # Convert to one-hot if needed by diffusion process
+        if diffusion.requires_one_hot:
+            probs = F.one_hot(probs, num_classes=logits.shape[-1]).float()
+    else:
+        probs = torch.nn.Softmax(dim=-1)(logits)
 
     if not predict_x0:
         retval = logits if return_logits else probs
-        if return_x0:
-            return retval, None
-        else:
-            return retval
+        return (retval, None) if return_x0 else retval
 
-    if maximum_likelihood:
-        probs = probs.argmax(-1)
+    # Ensure proper shape for diffusion process
+    if len(probs.shape) == 2:  # If we got [batch_size, seq_len] from argmax
+        probs = probs.unsqueeze(-1)  # Add vocab dimension
 
-    # we use this to compute p(x_{t-1} | x_t) = sum_x0 q(x_{t-1} | x_t, x_0)
-    # p(x_0 | x_t).
+    # Compute posterior using diffusion process
     qt_probs, _ = diffusion.sample_and_compute_posterior_q(
         x_0=probs,
         t=t - step_size,
@@ -635,18 +644,10 @@ def p_forward(
         word_freq_logits=word_freq_logits
     )
 
-    retval_x0 = logits if return_logits else probs
-    retval = qt_probs
+    # Special case handling
+    retval = (logits if return_logits else probs) if t == step_size else qt_probs
 
-    # we can special case t = 1 to just use the raw logits outputs.
-    # mask = ((t == step_size) & special_case_x0).long()
-    # retval = retval_x0 + (1 - mask) * retval
-    retval = retval_x0 if t == step_size else retval
-
-    if return_x0:
-        return retval, retval_x0
-    else:
-        return retval
+    return (retval, (logits if return_logits else probs)) if return_x0 else retval
 
 
 def compute_prior_kl(x_start, diffusion, target_mask=None, word_freq_logits=None):

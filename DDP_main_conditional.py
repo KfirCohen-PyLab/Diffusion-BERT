@@ -16,7 +16,7 @@ from tqdm import tqdm
 from sample import Categorical, WholeWordMasking
 import datetime
 
-
+scaler = torch.cuda.amp.GradScaler()
 
 def set_seed(args):
     random.seed(args.seed)
@@ -27,21 +27,21 @@ def set_seed(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", default=1, type=int, required=False)
+    parser.add_argument("--epochs", default=5, type=int, required=False)
     parser.add_argument("--model_name_or_path", default='bert-base-uncased', type=str, required=False)
     parser.add_argument("--task_name", default='qqp', type=str, required=False)
     parser.add_argument("--lr", default=3e-5, type=float, required=False)
-    parser.add_argument("--batch_size", default=64, type=int, required=False)
+    parser.add_argument("--batch_size", default=16, type=int, required=False)
     parser.add_argument("--word_freq_lambda", default=0.0, type=float, required=False)
-    parser.add_argument("--num_steps", default=32, type=int, required=False)
-    parser.add_argument("--eval_step_size", default=8, type=int, required=False)
-    parser.add_argument("--accumulation_steps", default=4, type=int, required=False)
+    parser.add_argument("--num_steps", default=16, type=int, required=False)
+    parser.add_argument("--eval_step_size", default=4, type=int, required=False)
+    parser.add_argument("--accumulation_steps", default=2, type=int, required=False)
     parser.add_argument("--hybrid_lambda", default=3e-4, type=float, required=False)
-    parser.add_argument("--eval_steps", default=50, type=int, required=False)
+    parser.add_argument("--eval_steps", default=200, type=int, required=False)
     parser.add_argument("--seed", default=42, type=int, required=False)
     parser.add_argument("--device", default='cuda:0', type=str, required=False)
-    parser.add_argument("--logging_steps", default=200, type=int, required=False)
-    parser.add_argument("--save_steps", default=100, type=int, required=False)
+    parser.add_argument("--logging_steps", default=100, type=int, required=False)
+    parser.add_argument("--save_steps", default=500, type=int, required=False)
     parser.add_argument('--predict_x0', default=True, type=bool, required=False)
     parser.add_argument("--load_step", default=-1, type=int, required=False)
     parser.add_argument("--sample_strategy", default='Categorical', type=str, required=False)
@@ -175,62 +175,75 @@ if __name__ == '__main__':
     i = -1
     print(args.epochs)
     #import pdb;pdb.set_trace()
-    for epoch in range(args.epochs):
-        for batch in tqdm(train_loader):
-            i += 1
-            for k, v in batch.items():
-                batch[k] = v.to(device)
-                
-            t = diffusion_instance.sample_t()
-            metrics = diffusion_condition.compute_kl_reverse_process(
-                batch['input_ids'],
-                t.to(device),
-                denoise_fn=functools.partial(
-                    denoise_fn,
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    target_mask=batch['target_mask']
-                ),
-                diffusion=diffusion_instance,
-                target_mask=batch['target_mask'],
-                hybrid_lambda=args.hybrid_lambda,
-                predict_x0=args.predict_x0,
-                word_freq_logits=torch.zeros_like(batch['input_ids'])
-            )
+    scaler = torch.cuda.amp.GradScaler()
 
-            loss = metrics['loss']
+    for epoch in range(args.epochs):
+        model.train()
+        optimizer.zero_grad()
+        
+        for i, batch in enumerate(tqdm(train_loader)):
+            # Memory monitoring
+            print(f"Memory allocated: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+            print(f"Memory cached: {torch.cuda.memory_reserved()/1024**2:.2f} MB")
+            torch.cuda.empty_cache()
             
-            if torch.isnan(loss):
-                nan_count += 1
-                continue
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Forward pass with mixed precision
+            with torch.cuda.amp.autocast():
+                t = diffusion_instance.sample_t().to(device)
+                metrics = diffusion_condition.compute_kl_reverse_process(
+                    batch['input_ids'],
+                    t,
+                    denoise_fn=functools.partial(
+                        denoise_fn,
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch['attention_mask'],
+                        target_mask=batch['target_mask']
+                    ),
+                    diffusion=diffusion_instance,
+                    target_mask=batch['target_mask'],
+                    hybrid_lambda=args.hybrid_lambda,
+                    predict_x0=args.predict_x0,
+                    word_freq_logits=torch.zeros_like(batch['input_ids'])
+                )
                 
-            train_loss += loss.item()
-            loss = loss / args.accumulation_steps
-            loss.backward()
+                # Normalize loss by accumulation steps
+                loss = metrics['loss'] / args.accumulation_steps
             
+            # Backward pass
+            scaler.scale(loss).backward()  # REMOVED THE DUPLICATE backward() CALL
+            
+            # Gradient clipping
             torch.nn.utils.clip_grad_value_(model.parameters(), 5)
             
-            if i % args.accumulation_steps == args.accumulation_steps - 1:
-                optimizer.step()
-                model.zero_grad()
+            # Step only when accumulation is complete
+            if (i + 1) % args.accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
                 warmup_scheduler.step()
-
             
-                
+            # Track training loss
+            if not torch.isnan(metrics['loss']):
+                train_loss += metrics['loss'].item()
+            else:
+                nan_count += 1
+            
+            # Evaluation
             if i % args.eval_steps == args.eval_steps - 1:
-                nan_count_in_dev = 0
                 model.eval()
                 dev_metrics = {
                     'elbo': 0.0,
                     'elbo_in_bits_per_dim': 0.0,
                 }
+                nan_count_in_dev = 0
                 
                 with torch.no_grad():
                     for dev_batch in dev_loader:
-                        for k, v in dev_batch.items():
-                            dev_batch[k] = v.to(device)
-                            
+                        dev_batch = {k: v.to(device) for k, v in dev_batch.items()}
+                        
                         batch_dev_metrics = diffusion_condition.discrete_diffusion_elbo(
                             dev_batch['input_ids'],
                             denoise_fn=functools.partial(
@@ -252,17 +265,19 @@ if __name__ == '__main__':
                                 dev_metrics[name] += val * dev_batch['input_ids'].size(0)
                             else:
                                 nan_count_in_dev += 1
-                    
-                    for name in dev_metrics.keys():
-                        dev_metrics[name] /= (len(dev_data) - nan_count_in_dev * args.batch_size * 2)
-                    
-                    if dev_metrics['elbo_in_bits_per_dim'] <= best_dev_elbo:
-                        best_dev_elbo = dev_metrics['elbo_in_bits_per_dim']
-                        torch.save({
-                            'model': model.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'warmup_scheduler': warmup_scheduler.state_dict(),
-                        }, f'./{save_path}/best({i}).pt')
+                
+                # Normalize dev metrics
+                for name in dev_metrics.keys():
+                    dev_metrics[name] /= max(1, (len(dev_data) - nan_count_in_dev * args.batch_size * 2))
+                
+                # Save best model
+                if dev_metrics['elbo_in_bits_per_dim'] <= best_dev_elbo:
+                    best_dev_elbo = dev_metrics['elbo_in_bits_per_dim']
+                    torch.save({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'warmup_scheduler': warmup_scheduler.state_dict(),
+                    }, f'./{save_path}/best({i}).pt')
                 
                 model.train()
 
