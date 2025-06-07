@@ -50,7 +50,7 @@ wget https://huggingface.co/datasets/librispeech_asr/resolve/main/data/train-*.j
 
 
 ######### Training ##########
-num_step * batch_size = number of samples
+num_steps = ceil(dataset_size / batch_size)
 
 num_step equivilent to epoch....
 
